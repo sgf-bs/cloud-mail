@@ -1,5 +1,3 @@
-import verifyRecordService from '../service/verify-record-service';
-
 export const userConst = {
 	status: {
 		NORMAL: 0,
