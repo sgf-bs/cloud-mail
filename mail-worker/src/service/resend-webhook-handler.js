@@ -77,5 +77,18 @@ export async function processWebhook(body, emailPersistence) {
 		return { handled: true, updated: false, reason: 'pending-email-insert' };
 	}
 
-	throw new BizError('更新邮件状态记录失败', 500);
+	// 后续状态先于邮件记录到达时，持久化等待发送流程完成写入，避免无限返回 500。
+	await emailPersistence.queueEmailStatus(params);
+
+	// 应用队列中最新的事件，覆盖查询与入队之间邮件刚好完成写入的并发窗口。
+	const reconciliation = await emailPersistence.applyQueuedEmailStatus(resendEmailId);
+	if (reconciliation.email) {
+		return {
+			handled: true,
+			updated: reconciliation.applied,
+			reason: reconciliation.applied ? 'reconciled-after-queue' : reconciliation.reason
+		};
+	}
+
+	return { handled: true, updated: false, reason: 'queued-for-email-insert' };
 }
