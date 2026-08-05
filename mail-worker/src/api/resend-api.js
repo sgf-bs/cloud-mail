@@ -27,6 +27,13 @@ app.post('/webhooks', async (c) => {
 		const result = await resendService.webhooks(c, body);
 		if (!result.handled) {
 			console.info(`Ignored Resend webhook event: ${body?.type ?? 'unknown'}`);
+		} else {
+			console.info('Processed Resend webhook', {
+				id: headers.id,
+				type: body?.type,
+				updated: result.updated,
+				reason: result.reason ?? 'updated'
+			});
 		}
 		return c.text('success', 200);
 	} catch (e) {

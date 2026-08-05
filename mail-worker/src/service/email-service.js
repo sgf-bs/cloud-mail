@@ -339,6 +339,21 @@ const emailService = {
 		//保存到数据库并返回结果
 		const emailResult = await orm(c).insert(email).values(emailData).returning().get();
 
+		if (!useCloudflareEmail && emailData.resendEmailId) {
+			try {
+				const reconciliation = await this.applyQueuedResendEmailStatus(c, emailData.resendEmailId);
+				if (reconciliation.email) {
+					Object.assign(emailResult, reconciliation.email);
+				}
+			} catch (error) {
+				// 邮件已经成功发送并落库，状态合并失败不能让客户端误认为发送失败。
+				console.error('Failed to reconcile queued Resend webhook', {
+					resendEmailId: emailData.resendEmailId,
+					message: error.message
+				});
+			}
+		}
+
 		//保存内嵌附件
 		if (imageDataList.length > 0) {
 			if (imageDataList.length > 10) {
@@ -766,6 +781,16 @@ const emailService = {
 				await c.env.db.prepare(
 					`CREATE INDEX IF NOT EXISTS idx_email_resend_email_id ON email(resend_email_id);`
 				).run();
+
+				await c.env.db.prepare(`
+					CREATE TABLE IF NOT EXISTS resend_webhook_pending (
+						resend_email_id TEXT PRIMARY KEY,
+						status INTEGER NOT NULL,
+						message TEXT,
+						event_time TEXT NOT NULL,
+						create_time TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+					);
+				`).run();
 			})().catch(error => {
 				resendWebhookSchemaPromise = undefined;
 				throw error;
@@ -794,6 +819,67 @@ const emailService = {
 		return orm(c).select().from(email)
 			.where(eq(email.resendEmailId, resendEmailId))
 			.get();
+	},
+
+	queueResendEmailStatus(c, params) {
+		const { resendEmailId, status, message, eventTime } = params;
+		return c.env.db.prepare(`
+			INSERT INTO resend_webhook_pending (resend_email_id, status, message, event_time)
+			VALUES (?, ?, ?, ?)
+			ON CONFLICT(resend_email_id) DO UPDATE SET
+				status = excluded.status,
+				message = excluded.message,
+				event_time = excluded.event_time
+			WHERE excluded.event_time >= resend_webhook_pending.event_time;
+		`).bind(resendEmailId, status, message, eventTime).run();
+	},
+
+	deleteQueuedResendEmailStatus(c, resendEmailId, eventTime) {
+		return c.env.db.prepare(
+			`DELETE FROM resend_webhook_pending WHERE resend_email_id = ? AND event_time = ?;`
+		).bind(resendEmailId, eventTime).run();
+	},
+
+	async applyQueuedResendEmailStatus(c, resendEmailId) {
+		await this.ensureResendWebhookSchema(c);
+		const pending = await c.env.db.prepare(`
+			SELECT status, message, event_time AS eventTime
+			FROM resend_webhook_pending
+			WHERE resend_email_id = ?
+			LIMIT 1;
+		`).bind(resendEmailId).first();
+
+		if (!pending) {
+			return { applied: false, reason: 'not-found', email: null };
+		}
+
+		const updatedEmail = await this.updateEmailStatus(c, {
+			resendEmailId,
+			status: pending.status,
+			message: pending.message,
+			eventTime: pending.eventTime
+		});
+		const existingEmail = updatedEmail || await this.selectByResendEmailId(c, resendEmailId);
+
+		if (!existingEmail) {
+			return { applied: false, reason: 'email-not-found', email: null };
+		}
+
+		// 仅删除刚读取的版本；若并发写入了更新事件，保留给另一条处理链路继续应用。
+		await this.deleteQueuedResendEmailStatus(c, resendEmailId, pending.eventTime);
+		return {
+			applied: Boolean(updatedEmail),
+			reason: updatedEmail ? 'updated' : 'stale-event',
+			email: existingEmail
+		};
+	},
+
+	async cleanupQueuedResendEmailStatus(c) {
+		await this.ensureResendWebhookSchema(c);
+		return c.env.db.prepare(`
+			DELETE FROM resend_webhook_pending
+			WHERE datetime(event_time) < datetime('now', '-30 days');
+		`).run();
 	},
 
 	async selectUserEmailCountList(c, userIds, type, del = isDel.NORMAL) {

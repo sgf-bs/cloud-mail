@@ -15,16 +15,27 @@ function createBody(type, data = {}) {
 	};
 }
 
-function createPersistence({ updatedEmail = null, existingEmail = null } = {}) {
+function createPersistence({ updatedEmail = null, existingEmail = null, reconciliation } = {}) {
 	const calls = [];
+	const queued = [];
+	const reconciled = [];
 	return {
 		calls,
+		queued,
+		reconciled,
 		async updateEmailStatus(params) {
 			calls.push(params);
 			return updatedEmail;
 		},
 		async selectByResendEmailId() {
 			return existingEmail;
+		},
+		async queueEmailStatus(params) {
+			queued.push(params);
+		},
+		async applyQueuedEmailStatus(resendEmailId) {
+			reconciled.push(resendEmailId);
+			return reconciliation ?? { applied: false, reason: 'email-not-found', email: null };
 		}
 	};
 }
@@ -70,13 +81,47 @@ describe('Resend email event processing', () => {
 		});
 	});
 
-	it('requests a retry when a later delivery event has no matching email', async () => {
-		await assert.rejects(
-			processWebhook(createBody('email.delivered'), createPersistence()),
-			error => error.name === 'BizError'
-				&& error.code === 500
-				&& error.message === '更新邮件状态记录失败'
-		);
+	it('queues a later delivery event when the email insert is still pending', async () => {
+		const persistence = createPersistence();
+		const result = await processWebhook(createBody('email.delivered'), persistence);
+
+		assert.deepEqual(result, {
+			handled: true,
+			updated: false,
+			reason: 'queued-for-email-insert'
+		});
+		assert.equal(persistence.queued.length, 1);
+		assert.equal(persistence.queued[0].resendEmailId, 'email_123');
+		assert.deepEqual(persistence.reconciled, ['email_123']);
+	});
+
+	it('reconciles a delivery event when the email appears during queueing', async () => {
+		const persistence = createPersistence({
+			reconciliation: { applied: true, reason: 'updated', email: { emailId: 1 } }
+		});
+		const result = await processWebhook(createBody('email.delivered'), persistence);
+
+		assert.deepEqual(result, {
+			handled: true,
+			updated: true,
+			reason: 'reconciled-after-queue'
+		});
+		assert.equal(persistence.queued.length, 1);
+		assert.deepEqual(persistence.reconciled, ['email_123']);
+		assert.equal(persistence.calls.length, 1);
+	});
+
+	it('keeps a newer stored status when a queued event is stale', async () => {
+		const persistence = createPersistence({
+			reconciliation: { applied: false, reason: 'stale-event', email: { emailId: 1 } }
+		});
+		const result = await processWebhook(createBody('email.delivered'), persistence);
+
+		assert.deepEqual(result, {
+			handled: true,
+			updated: false,
+			reason: 'stale-event'
+		});
 	});
 
 	it('ignores an older event instead of regressing the stored status', async () => {
