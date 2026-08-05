@@ -1,7 +1,7 @@
 import orm from '../entity/orm';
 import email from '../entity/email';
 import { attConst, emailConst, isDel, settingConst } from '../const/entity-const';
-import { and, desc, eq, gt, inArray, lt, count, asc, sql, ne, or, like, lte, gte } from 'drizzle-orm';
+import { and, desc, eq, gt, inArray, lt, count, asc, sql, ne, or, like, lte, gte, isNull } from 'drizzle-orm';
 import { star } from '../entity/star';
 import settingService from './setting-service';
 import accountService from './account-service';
@@ -22,6 +22,8 @@ import domainUtils from '../utils/domain-uitls';
 import account from "../entity/account";
 import { att } from '../entity/att';
 import telegramService from './telegram-service';
+
+let resendWebhookSchemaPromise;
 
 const emailService = {
 
@@ -744,12 +746,54 @@ const emailService = {
 		await orm(c).delete(email).where(inArray(email.userId, userIds)).run();
 	},
 
+	ensureResendWebhookSchema(c) {
+		if (!resendWebhookSchemaPromise) {
+			resendWebhookSchemaPromise = (async () => {
+				const column = await c.env.db.prepare(
+					`SELECT 1 FROM pragma_table_info('email') WHERE name = 'resend_event_time' LIMIT 1`
+				).first();
+
+				if (!column) {
+					try {
+						await c.env.db.prepare(`ALTER TABLE email ADD COLUMN resend_event_time TEXT;`).run();
+					} catch (error) {
+						if (!String(error?.message).includes('duplicate column name')) {
+							throw error;
+						}
+					}
+				}
+
+				await c.env.db.prepare(
+					`CREATE INDEX IF NOT EXISTS idx_email_resend_email_id ON email(resend_email_id);`
+				).run();
+			})().catch(error => {
+				resendWebhookSchemaPromise = undefined;
+				throw error;
+			});
+		}
+
+		return resendWebhookSchemaPromise;
+	},
+
 	updateEmailStatus(c, params) {
-		const { status, resendEmailId, message } = params;
+		const { status, resendEmailId, message, eventTime } = params;
 		return orm(c).update(email).set({
 			status: status,
-			message: message
-		}).where(eq(email.resendEmailId, resendEmailId)).returning().get();
+			message: message,
+			resendEventTime: eventTime
+		}).where(and(
+			eq(email.resendEmailId, resendEmailId),
+			or(
+				isNull(email.resendEventTime),
+				lte(email.resendEventTime, eventTime)
+			)
+		)).returning().get();
+	},
+
+	selectByResendEmailId(c, resendEmailId) {
+		return orm(c).select().from(email)
+			.where(eq(email.resendEmailId, resendEmailId))
+			.get();
 	},
 
 	async selectUserEmailCountList(c, userIds, type, del = isDel.NORMAL) {

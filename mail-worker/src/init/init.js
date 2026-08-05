@@ -29,8 +29,21 @@ const dbInit = {
 		await this.v2_8DB(c);
 		await this.v2_9DB(c);
 		await this.v3_0DB(c);
+		await this.v3_1DB(c);
 		await settingService.refresh(c);
 		return c.text('success');
+	},
+
+	async v3_1DB(c) {
+		const column = await c.env.db.prepare(
+			`SELECT 1 FROM pragma_table_info('email') WHERE name = 'resend_event_time' LIMIT 1`
+		).first();
+		if (!column) {
+			await c.env.db.prepare(`ALTER TABLE email ADD COLUMN resend_event_time TEXT;`).run();
+		}
+		await c.env.db.prepare(
+			`CREATE INDEX IF NOT EXISTS idx_email_resend_email_id ON email(resend_email_id);`
+		).run();
 	},
 
 	async v3_0DB(c) {
